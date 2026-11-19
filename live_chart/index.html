@@ -1,0 +1,211 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<!-- TradingView Lightweight Charts, Apache-2.0 -->
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #141824; overflow: hidden;
+               font-family: -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #wrap { position: relative; width: 100%; }
+  #chart, #overlay { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  #overlay { pointer-events: none; }
+  #msg { position: absolute; left: 12px; top: 8px; color: #8a93a6; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="wrap"><div id="chart"></div><canvas id="overlay"></canvas><div id="msg"></div></div>
+<script>
+/* Streamlit component that keeps one chart alive and glides the price between updates,
+   so the graph moves continuously instead of redrawing every second. */
+const UP = "#1fc77e", DOWN = "#ff4d5a", LINE = "#3d8bff", BG = "#141824";
+const TZ = -new Date().getTimezoneOffset() * 60;   // show the viewer's local time
+const ANIM_MS = 950;
+
+let chart = null, main = null, vol = null;
+let cfgKey = null, kind = "Area", step = 1, dec = 2;
+let bars = [];            // {time, open, high, low, close, v}, time shifted to local
+let drawnTime = null;     // newest bar time already committed to the series
+let trades = [];
+let anim = { from: 0, to: 0, t0: 0 };
+let shown = null;         // price currently drawn at the tip
+
+function send(type, extra) {
+  window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type }, extra || {}), "*");
+}
+
+function init(h) {
+  const wrap = document.getElementById("wrap");
+  wrap.style.height = h + "px";
+  const el = document.getElementById("chart");
+  chart = LightweightCharts.createChart(el, {
+    width: el.clientWidth, height: h,
+    layout: { background: { type: "solid", color: BG }, textColor: "#8a93a6", fontSize: 11 },
+    grid: { vertLines: { color: "rgba(255,255,255,0.05)" }, horzLines: { color: "rgba(255,255,255,0.05)" } },
+    rightPriceScale: { borderVisible: false, scaleMargins: { top: 0.12, bottom: 0.18 } },
+    timeScale: { borderVisible: false, timeVisible: true, secondsVisible: true,
+                 rightOffset: 18, shiftVisibleRangeOnNewBar: true },
+    crosshair: { mode: 0 },
+  });
+  new ResizeObserver(() => chart.applyOptions({ width: el.clientWidth })).observe(el);
+  requestAnimationFrame(frame);
+}
+
+function rebuild() {
+  if (main) chart.removeSeries(main);
+  if (vol) chart.removeSeries(vol);
+  const priceFormat = { type: "price", precision: dec, minMove: Math.pow(10, -dec) };
+  const priceLine = { priceLineColor: "rgba(255,255,255,0.55)", priceLineStyle: 1 };
+  if (kind === "Area") {
+    main = chart.addAreaSeries(Object.assign({
+      lineColor: LINE, lineWidth: 2, topColor: "rgba(61,139,255,0.35)",
+      bottomColor: "rgba(61,139,255,0.0)", priceFormat, lastPriceAnimation: 1,
+      crosshairMarkerRadius: 4 }, priceLine));
+  } else {
+    main = chart.addCandlestickSeries(Object.assign({
+      upColor: UP, downColor: DOWN, borderVisible: false, wickUpColor: UP,
+      wickDownColor: DOWN, priceFormat }, priceLine));
+  }
+  vol = chart.addHistogramSeries({ priceScaleId: "vol", priceFormat: { type: "volume" },
+                                   lastValueVisible: false, priceLineVisible: false });
+  chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
+}
+
+const pt = (b, close) => kind === "Area"
+  ? { time: b.time, value: close ?? b.close }
+  : { time: b.time, open: b.open, high: Math.max(b.high, close ?? b.close),
+      low: Math.min(b.low, close ?? b.close), close: close ?? b.close };
+const vpt = b => ({ time: b.time, value: b.v || 0,
+                    color: b.close >= b.open ? "rgba(31,199,126,0.25)" : "rgba(255,77,90,0.25)" });
+
+function onRender(a) {
+  if (!chart) { init(a.height); send("streamlit:setFrameHeight", { height: a.height }); }
+  document.getElementById("msg").textContent = a.message || "";
+  trades = a.trades || [];
+  const incoming = (a.candles || []).map(c => ({ time: c[0] + TZ, open: c[1], high: c[2],
+                                                low: c[3], close: c[4], v: c[5] }));
+  if (!incoming.length) return;
+  const key = a.chart_id + "|" + a.kind;
+
+  if (key !== cfgKey) {                      // new asset / timeframe / chart type
+    cfgKey = key; kind = a.kind; step = a.step; dec = a.dec;
+    rebuild();
+    bars = incoming;
+    main.setData(bars.map(b => pt(b)));
+    vol.setData(bars.map(vpt));
+    drawnTime = bars[bars.length - 1].time;
+    shown = bars[bars.length - 1].close;
+    chart.timeScale().scrollToRealTime();
+  } else {
+    for (const b of incoming) {
+      const last = bars[bars.length - 1];
+      if (b.time > last.time) bars.push(b);
+      else if (b.time === last.time) bars[bars.length - 1] = b;
+      else {                                  // refresh a recent, already-closed bar
+        const i = bars.findIndex(x => x.time === b.time);
+        if (i >= 0) bars[i] = b;
+      }
+    }
+    if (bars.length > 3000) bars = bars.slice(-3000);
+    const last = bars[bars.length - 1];
+    for (const b of bars) {                   // commit closed bars in order
+      if (b.time >= drawnTime && b !== last) { main.update(pt(b)); vol.update(vpt(b)); }
+    }
+    vol.update(vpt(last));
+    drawnTime = last.time;
+  }
+
+  const last = bars[bars.length - 1];
+  if (a.price != null) {
+    last.close = a.price;
+    last.high = Math.max(last.high, a.price);
+    last.low = Math.min(last.low, a.price);
+  }
+  anim = { from: shown ?? last.close, to: last.close, t0: performance.now() };
+}
+
+function frame(now) {
+  if (main && bars.length) {
+    const last = bars[bars.length - 1];
+    const k = Math.min(1, (now - anim.t0) / ANIM_MS);
+    const e = 1 - Math.pow(1 - k, 3);
+    shown = anim.from + (anim.to - anim.from) * e;
+    main.update(pt(last, shown));
+    drawOverlay();
+  }
+  requestAnimationFrame(frame);
+}
+
+/* x pixel for a UTC timestamp, including times in the future (beyond the last bar) */
+function xOf(utc) {
+  const t = utc + TZ, n = bars.length - 1;
+  let logical;
+  if (t >= bars[n].time) logical = n + (t - bars[n].time) / step;
+  else if (t <= bars[0].time) logical = (t - bars[0].time) / step;
+  else {
+    let lo = 0, hi = n;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; (bars[m].time <= t ? lo = m : hi = m); }
+    logical = lo + (t - bars[lo].time) / (bars[hi].time - bars[lo].time);
+  }
+  return chart.timeScale().logicalToCoordinate(logical);
+}
+
+function drawOverlay() {
+  const cv = document.getElementById("overlay");
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== w * dpr || cv.height !== h * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const paneW = w - chart.priceScale("right").width();
+  const paneH = h - chart.timeScale().height();
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, 0, paneW, paneH); ctx.clip();
+  ctx.font = "bold 11px -apple-system, Segoe UI, Roboto, sans-serif";
+  const nowSec = Date.now() / 1000;
+
+  for (const t of trades) {
+    const y = main.priceToCoordinate(t.entry);
+    const x0 = xOf(t.opened), x1 = xOf(t.expiry);
+    if (y == null || x0 == null || x1 == null) continue;
+    const col = t.dir === "up" ? UP : DOWN;
+    const open = t.status === "open";
+
+    ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.setLineDash(open ? [] : [3, 3]);
+    ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = col; ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    if (t.dir === "up") { ctx.moveTo(x0, y - 7); ctx.lineTo(x0 - 6, y + 4); ctx.lineTo(x0 + 6, y + 4); }
+    else { ctx.moveTo(x0, y + 7); ctx.lineTo(x0 - 6, y - 4); ctx.lineTo(x0 + 6, y - 4); }
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = col; ctx.textAlign = "center";
+    ctx.fillText("$" + Math.round(t.amount).toLocaleString(), x0, t.dir === "up" ? y - 11 : y + 18);
+
+    if (open) {
+      ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 1; ctx.setLineDash([5, 4]);
+      ctx.beginPath(); ctx.moveTo(x1, 0); ctx.lineTo(x1, paneH); ctx.stroke(); ctx.setLineDash([]);
+      const left = Math.max(0, Math.ceil(t.expiry - nowSec));
+      const label = "🏁 " + Math.floor(left / 60) + ":" + String(left % 60).padStart(2, "0");
+      ctx.textAlign = "left"; ctx.fillStyle = "#e6e9f0";
+      ctx.fillText(label, x1 + 4, 14);
+    } else if (t.result != null) {
+      const txt = (t.result >= 0 ? "+" : "") + t.result.toFixed(2);
+      ctx.textAlign = "left";
+      const tw = ctx.measureText(txt).width;
+      ctx.fillStyle = "rgba(0,0,0,0.55)"; ctx.fillRect(x1 + 3, y - 9, tw + 8, 17);
+      ctx.fillStyle = t.result > 0 ? UP : DOWN; ctx.fillText(txt, x1 + 7, y + 4);
+    }
+  }
+  ctx.restore();
+}
+
+window.addEventListener("message", ev => {
+  if (ev.data && ev.data.type === "streamlit:render") onRender(ev.data.args || {});
+});
+send("streamlit:componentReady", { apiVersion: 1 });
+</script>
+</body>
+</html>

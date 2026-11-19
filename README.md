@@ -16,7 +16,7 @@ No real money is involved.
 
 ## Features
 
-- Area or candlestick chart with volume, a live price line and room to the right of the price
+- Smooth, continuous live chart (no blinking): the price glides between updates; area or candles, with volume
 - Timeframes from 1s to 15m, depending on the source
 - UP/DOWN trades with 30s–15m expiry, drawn on the chart with entry and finish lines
 - Crypto trades settle on Binance's exact 1-second close at expiry
@@ -64,6 +64,7 @@ This is an unofficial client, and Expert Option can change its protocol at any t
 - Expert Option protocol and original client: **ChipaDevTeam / Vigo Walker**,
   [ExpertOptionApi](https://github.com/ChipaDevTeam/ExpertOptionApi), MIT License. The original
   license is kept in `eoapi/LICENSE-ExpertOptionApi`.
+- Chart: [TradingView Lightweight Charts](https://github.com/tradingview/lightweight-charts) (Apache-2.0), loaded from unpkg.
 - Market data: Binance public API and Yahoo Finance. This project isn't affiliated with Binance,
   Yahoo or Expert Option.
 

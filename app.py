@@ -15,7 +15,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import plotly.graph_objects as go
+import streamlit.components.v1 as components
 import requests
 
 from eoapi import REGIONS, ExpertOptionClient
@@ -68,6 +68,10 @@ st.markdown(f"""
 <style>
   .stApp {{ background:{BG}; color:#e6e9f0; }}
   header[data-testid="stHeader"] {{ background:transparent; }}
+  /* no fade/blink while the page refreshes every second */
+  [data-stale="true"], .stale-element, [data-testid="stElementContainer"],
+  [data-testid="element-container"] {{ opacity:1 !important; transition:none !important; }}
+  [data-testid="stStatusWidget"] {{ visibility:hidden; }}
   .block-container {{ padding-top:1.2rem; padding-bottom:1rem; max-width:1500px; }}
   .st-key-up_btn button, .st-key-down_btn button {{ border:none; color:#fff; font-weight:700;
       font-size:1.15rem; height:3.4rem; }}
@@ -330,107 +334,27 @@ def local_tz():
         return datetime.now().astimezone().tzinfo
 
 
-def to_local(ts_list, tz):
-    return pd.to_datetime(list(ts_list), unit="s", utc=True).tz_convert(tz)
+_live_chart = components.declare_component(
+    "live_chart", path=str(Path(__file__).with_name("live_chart")))
 
 
-def build_chart(asset, chart_type, tf, df, price, tz):
-    dec = ASSETS[asset]["dec"]
-    step = TIMEFRAMES[ASSETS[asset]["src"]][tf][1]
-    x = df.index.tz_convert(tz)
-    last_x = x[-1]
-    start_ts = df.index[0].timestamp()
-    last_ts = df.index[-1].timestamp()
-
-    trades = [t for t in st.session_state.acct["trades"]
-              if t["asset"] == asset and t["expiry"] >= start_ts]
-    lo, hi = df["low"].min(), df["high"].max()
-    if chart_type == "Area":
-        lo, hi = df["close"].min(), df["close"].max()
-    for t in trades:
-        lo, hi = min(lo, t["entry"]), max(hi, t["entry"])
-    lo, hi = min(lo, price), max(hi, price)
-    pad = (hi - lo) * 0.15 or price * 1e-4
-    y0, y1 = lo - pad, hi + pad
-
-    fig = go.Figure()
-
-    # volume in the bottom fifth
-    vol = df["volume"].fillna(0)
-    if vol.sum() > 0:
-        vcol = [("rgba(31,199,126,0.25)" if c >= o else "rgba(255,77,90,0.25)")
-                for o, c in zip(df["open"], df["close"])]
-        fig.add_trace(go.Bar(x=x, y=vol, marker_color=vcol, yaxis="y2", hoverinfo="skip",
-                             showlegend=False))
-
-    if chart_type == "Area":
-        xs = list(x) + [last_x]
-        ys = list(df["close"]) + [price]
-        fig.add_trace(go.Scatter(x=xs, y=[y0] * len(xs), mode="lines", line=dict(width=0),
-                                 hoverinfo="skip", showlegend=False))
-        fig.add_trace(go.Scatter(
-            x=xs, y=ys, mode="lines", fill="tonexty", line=dict(color=LINE, width=2),
-            fillgradient=dict(type="vertical", colorscale=[[0, "rgba(61,139,255,0)"],
-                                                           [1, "rgba(61,139,255,0.35)"]]),
-            hovertemplate=f"%{{x|%H:%M:%S}}<br>%{{y:.{dec}f}}<extra></extra>", showlegend=False))
-    else:
-        fig.add_trace(go.Candlestick(
-            x=x + pd.Timedelta(seconds=step / 2), open=df["open"], high=df["high"],
-            low=df["low"], close=df["close"], whiskerwidth=0, showlegend=False, name=asset,
-            increasing=dict(line=dict(color=UP, width=1), fillcolor=UP),
-            decreasing=dict(line=dict(color=DOWN, width=1), fillcolor=DOWN)))
-
-    dot_x = last_x if chart_type == "Area" else last_x + pd.Timedelta(seconds=step / 2)
-    for size, color in ((16, "rgba(255,255,255,0.18)"), (7, "#fff")):
-        fig.add_trace(go.Scatter(x=[dot_x], y=[price], mode="markers", hoverinfo="skip",
-                                 marker=dict(size=size, color=color), showlegend=False))
-
-    fig.add_hline(y=price, line=dict(color="rgba(255,255,255,0.45)", width=1, dash="dot"))
-    fig.add_annotation(x=1, xref="paper", y=price, xanchor="left", showarrow=False,
-                       text=f"<b>{price:.{dec}f}</b>", font=dict(color="#fff", size=12),
-                       bgcolor=LINE, borderpad=4)
-
-    for t in trades:
-        col = UP if t["dir"] == "up" else DOWN
-        xo, xe = to_local([t["opened"], t["expiry"]], tz)
-        is_open = t["status"] == "open"
-        fig.add_trace(go.Scatter(
-            x=[xo, xe], y=[t["entry"]] * 2, mode="lines", hoverinfo="skip", showlegend=False,
-            line=dict(color=col, width=2, dash="solid" if is_open else "dot")))
-        fig.add_trace(go.Scatter(
-            x=[xo], y=[t["entry"]], mode="markers+text", showlegend=False, hoverinfo="skip",
-            marker=dict(size=11, color=col, line=dict(color="#fff", width=1.5),
-                        symbol="triangle-up" if t["dir"] == "up" else "triangle-down"),
-            text=[f"${t['amount']:,.0f}"], textposition="top center",
-            textfont=dict(color=col, size=11)))
-        if is_open:
-            fig.add_vline(x=xe, line=dict(color="rgba(255,255,255,0.35)", width=1, dash="dash"))
-            fig.add_annotation(x=xe, y=1, yref="paper", yanchor="bottom", showarrow=False,
-                               text="🏁", font=dict(size=14))
-        else:
-            res = t["result"]
-            fig.add_annotation(x=xe, y=t["entry"], showarrow=False, xanchor="left",
-                               text=f"{'+' if res >= 0 else ''}{res:,.2f}",
-                               font=dict(color=UP if res > 0 else DOWN, size=11),
-                               bgcolor="rgba(0,0,0,0.5)", borderpad=3)
-
-    future = max([VISIBLE * step * 0.18] + [t["expiry"] - last_ts + step * 2 for t in trades
-                                           if t["status"] == "open"])
-    x_end = to_local([last_ts + future], tz)[0]
-    fig.update_layout(
-        height=560, margin=dict(l=10, r=85, t=30, b=30), bargap=0.15,
-        paper_bgcolor=BG, plot_bgcolor=BG, font=dict(color="#8a93a6", size=11),
-        hovermode="x unified", dragmode="pan", uirevision=f"{asset}-{tf}-{chart_type}",
-        xaxis=dict(range=[x[0], x_end], gridcolor=GRID, zeroline=False,
-                   rangeslider=dict(visible=False),
-                   tickformat="%H:%M:%S" if step < 60 else "%H:%M"),
-        yaxis=dict(range=[y0, y1], side="right", gridcolor=GRID, zeroline=False,
-                   tickformat=f".{dec}f"),
-        yaxis2=dict(overlaying="y", range=[0, max(vol.max(), 1) * 5], visible=False,
-                    fixedrange=True),
-        hoverlabel=dict(bgcolor="#1f2433", font_color="#e6e9f0"),
-    )
-    return fig
+def live_chart(asset, chart_type, tf, df, price, height=560, message=""):
+    """Persistent chart: stays mounted between reruns and animates new prices smoothly."""
+    a = ASSETS[asset]
+    step = TIMEFRAMES[a["src"]][tf][1]
+    secs = (df.index.asi8 // 10**9).tolist()
+    candles = [[int(t), float(o), float(h), float(lo), float(c), float(v or 0)]
+               for t, o, h, lo, c, v in zip(secs, df["open"], df["high"], df["low"],
+                                             df["close"], df["volume"].fillna(0))]
+    start = secs[0] if secs else 0
+    trades = [dict(opened=float(t["opened"]), expiry=float(t["expiry"]), entry=float(t["entry"]),
+                   dir=t["dir"], amount=float(t["amount"]), status=t["status"],
+                   result=None if t["result"] is None else float(t["result"]))
+              for t in st.session_state.acct["trades"]
+              if t["asset"] == asset and t["expiry"] >= start]
+    return _live_chart(key="live_chart", default=None, height=height, kind=chart_type,
+                       step=step, dec=a["dec"], candles=candles, price=float(price),
+                       trades=trades, message=message, chart_id=f"{asset}|{tf}")
 
 
 # ================================================================ sidebar
@@ -529,16 +453,15 @@ def live():
     if df is None or px is None or len(df) == 0:
         st.error(f"Couldn't load market data for {asset}: {err1 or err2 or 'no data'}")
         return
-    if err1 or err2:
-        st.warning(f"Connection problem, showing last data: {err1 or err2}", icon="📡")
+    # shown inside the chart so the layout never jumps
+    note = f"📡 connection problem, showing last data ({type(err1 or err2).__name__})" \
+        if (err1 or err2) else ""
     price = px[0]
     is_open, qt = safe(("o", asset), market_open, asset)[0] or (True, None)
 
     chart_col, panel = st.columns([4, 1])
     with chart_col:
-        st.plotly_chart(build_chart(asset, chart_type, tf, df, price, tz),
-                        use_container_width=True, key="chart",
-                        config={"displayModeBar": False, "scrollZoom": True})
+        live_chart(asset, chart_type, tf, df, price, message=note)
 
     with panel:
         if a["src"] == "binance":
